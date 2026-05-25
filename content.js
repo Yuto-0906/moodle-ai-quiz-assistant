@@ -113,6 +113,83 @@
     return blobToDataUrl(blob);
   }
 
+  function loadImage(dataUrl) {
+    return new Promise((resolve, reject) => {
+      const image = new Image();
+      image.onload = () => resolve(image);
+      image.onerror = () => reject(new Error('画像のデコードに失敗しました'));
+      image.src = dataUrl;
+    });
+  }
+
+  async function createContactSheet(images, slot) {
+    if (images.length <= 1) return images;
+
+    const decoded = await Promise.all(images.map(async img => ({
+      ...img,
+      element: await loadImage(img.dataUrl)
+    })));
+
+    const cellWidth = 260;
+    const labelHeight = 28;
+    const padding = 16;
+    const gap = 12;
+    const cols = Math.min(2, decoded.length);
+    const rows = Math.ceil(decoded.length / cols);
+    const cellHeight = Math.max(...decoded.map(img => {
+      const scale = Math.min(1, cellWidth / img.width);
+      return Math.round(img.height * scale) + labelHeight;
+    }));
+
+    const canvas = document.createElement('canvas');
+    canvas.width = padding * 2 + cols * cellWidth + (cols - 1) * gap;
+    canvas.height = padding * 2 + rows * cellHeight + (rows - 1) * gap;
+
+    const ctx = canvas.getContext('2d');
+    ctx.fillStyle = '#ffffff';
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+    ctx.fillStyle = '#111111';
+    ctx.font = '16px sans-serif';
+    ctx.textBaseline = 'top';
+
+    decoded.forEach((img, i) => {
+      const col = i % cols;
+      const row = Math.floor(i / cols);
+      const x = padding + col * (cellWidth + gap);
+      const y = padding + row * (cellHeight + gap);
+      const scale = Math.min(1, cellWidth / img.width);
+      const drawWidth = Math.round(img.width * scale);
+      const drawHeight = Math.round(img.height * scale);
+
+      ctx.fillText(`image ${img.index}`, x, y);
+      ctx.strokeStyle = '#d0d7de';
+      ctx.strokeRect(x, y + labelHeight, cellWidth, cellHeight - labelHeight);
+      ctx.drawImage(img.element, x, y + labelHeight, drawWidth, drawHeight);
+    });
+
+    const dataUrl = canvas.toDataURL('image/png');
+    const part = dataUrlToImagePart(dataUrl);
+    if (!part) return images;
+
+    return [{
+      slot,
+      index: 1,
+      alt: `slot ${slot} contact sheet of ${images.length} images`,
+      src: '',
+      width: canvas.width,
+      height: canvas.height,
+      mimeType: part.mimeType,
+      base64: part.base64,
+      dataUrl,
+      combinedFrom: images.map(img => ({
+        index: img.index,
+        width: img.width,
+        height: img.height,
+        alt: img.alt
+      }))
+    }];
+  }
+
   async function collectQuestionImages(qDiv, slot) {
     const candidates = Array.from(qDiv.querySelectorAll('img')).filter(isProbablyContentImage);
     const images = [];
@@ -159,8 +236,9 @@
 
       const images = await collectQuestionImages(qDiv, info.slot);
       if (images.length > 0) {
-        info.images = images.map(({ dataUrl, ...meta }) => meta);
-        allImages.push(...images);
+        const preparedImages = await createContactSheet(images, info.slot);
+        info.images = preparedImages.map(({ dataUrl, ...meta }) => meta);
+        allImages.push(...preparedImages);
       }
     }
 
@@ -380,6 +458,13 @@
         q.images.forEach(img => {
           const alt = img.alt ? ` alt="${img.alt}"` : '';
           lines.push(`  [slot:${q.slot} image:${img.index}] ${img.mimeType} ${img.width}x${img.height}${alt}`);
+          if (img.combinedFrom?.length) {
+            lines.push(`    ※ この画像は元画像${img.combinedFrom.length}枚を並べた合成画像です。各パネルの "image N" ラベルを参照してください。`);
+            img.combinedFrom.forEach(src => {
+              const srcAlt = src.alt ? ` alt="${src.alt}"` : '';
+              lines.push(`    元画像 image ${src.index}: ${src.width}x${src.height}${srcAlt}`);
+            });
+          }
         });
       }
 
