@@ -1,0 +1,223 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <title>Moodle AI Quiz Assistant</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      width: 310px;
+      padding: 16px;
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Helvetica Neue', sans-serif;
+      font-size: 13px;
+      color: #333;
+      background: #fff;
+    }
+
+    h2 {
+      font-size: 15px;
+      color: #1a73e8;
+      margin-bottom: 14px;
+      padding-bottom: 8px;
+      border-bottom: 2px solid #e8f0fe;
+    }
+
+    .field { margin-bottom: 12px; }
+
+    label {
+      display: block;
+      font-weight: 600;
+      color: #555;
+      margin-bottom: 4px;
+    }
+
+    select, input[type="password"], input[type="text"] {
+      width: 100%;
+      padding: 7px 10px;
+      border: 1px solid #ccc;
+      border-radius: 5px;
+      font-size: 13px;
+      outline: none;
+      transition: border-color 0.15s;
+    }
+
+    select:focus, input:focus { border-color: #1a73e8; }
+
+    .api-key-wrapper { position: relative; }
+    .api-key-wrapper input { padding-right: 36px; }
+
+    .toggle-visibility {
+      position: absolute;
+      right: 8px;
+      top: 50%;
+      transform: translateY(-50%);
+      background: none;
+      border: none;
+      cursor: pointer;
+      font-size: 16px;
+      color: #888;
+      padding: 0;
+      line-height: 1;
+    }
+
+    /* Web provider info box */
+    .web-info {
+      background: #e8f0fe;
+      border: 1px solid #c5d8f8;
+      border-radius: 6px;
+      padding: 10px 12px;
+      font-size: 12px;
+      line-height: 1.6;
+      color: #1a5296;
+    }
+
+    .web-info strong { display: block; margin-bottom: 4px; font-size: 13px; }
+
+    .web-info ul {
+      padding-left: 16px;
+      margin-top: 4px;
+    }
+
+    .btn-save {
+      width: 100%;
+      padding: 9px;
+      background: #1a73e8;
+      color: #fff;
+      border: none;
+      border-radius: 5px;
+      font-size: 14px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: background 0.15s;
+      margin-top: 4px;
+    }
+
+    .btn-save:hover { background: #1557b0; }
+    .btn-save:active { background: #0d47a1; }
+
+    .model-tools {
+      display: none;
+      margin-top: 8px;
+    }
+
+    .btn-secondary {
+      width: 100%;
+      padding: 7px 9px;
+      background: #f8fafd;
+      color: #1a5296;
+      border: 1px solid #c5d8f8;
+      border-radius: 5px;
+      font-size: 12px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: background 0.15s, border-color 0.15s;
+    }
+
+    .btn-secondary:hover {
+      background: #e8f0fe;
+      border-color: #9bbcf2;
+    }
+
+    .btn-secondary:disabled {
+      cursor: default;
+      opacity: 0.65;
+    }
+
+    #status {
+      margin-top: 8px;
+      font-size: 12px;
+      color: #34a853;
+      text-align: center;
+      min-height: 18px;
+      white-space: pre-wrap;
+      line-height: 1.45;
+    }
+
+    #status.error { color: #ea4335; }
+
+    .hint {
+      margin-top: 10px;
+      font-size: 11px;
+      color: #888;
+      line-height: 1.5;
+    }
+
+    code {
+      background: #f1f3f4;
+      padding: 1px 4px;
+      border-radius: 3px;
+      font-size: 11px;
+    }
+  </style>
+</head>
+<body>
+  <h2>Moodle AI Quiz Assistant</h2>
+
+  <div class="field">
+    <label for="provider">AI プロバイダー</label>
+    <select id="provider">
+      <optgroup label="── API 利用 ──">
+        <option value="openai">OpenAI API (ChatGPT)</option>
+        <option value="gemini">Google Gemini API</option>
+      </optgroup>
+      <optgroup label="── Web UI 利用（ログイン済み） ──">
+        <option value="chatgpt-web">ChatGPT Web（APIキー不要）</option>
+        <option value="gemini-web">Gemini Web（APIキー不要）</option>
+      </optgroup>
+    </select>
+  </div>
+
+  <!-- API mode fields -->
+  <div id="api-fields">
+    <div class="field">
+      <label for="model">モデル</label>
+      <select id="model">
+        <optgroup label="OpenAI" data-provider="openai">
+          <option value="gpt-4o">GPT-4o</option>
+          <option value="gpt-4o-mini">GPT-4o mini</option>
+          <option value="gpt-4-turbo">GPT-4 Turbo</option>
+        </optgroup>
+        <optgroup label="Google Gemini" data-provider="gemini">
+          <option value="gemini-2.0-flash">Gemini 2.0 Flash</option>
+          <option value="gemini-1.5-pro">Gemini 1.5 Pro</option>
+          <option value="gemini-1.5-flash">Gemini 1.5 Flash</option>
+        </optgroup>
+      </select>
+      <div id="gemini-model-tools" class="model-tools">
+        <button type="button" class="btn-secondary" id="refreshGeminiModels">
+          Geminiモデル一覧を更新
+        </button>
+      </div>
+    </div>
+
+    <div class="field">
+      <label for="apiKey">API キー</label>
+      <div class="api-key-wrapper">
+        <input type="password" id="apiKey" placeholder="APIキーを入力してください">
+        <button class="toggle-visibility" id="toggleKey" title="表示/非表示">👁</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Web mode info -->
+  <div id="web-info" class="web-info" style="display:none; margin-bottom:12px;">
+    <strong>Web UI モードについて</strong>
+    「AIで解答」を押すと自動で新しいタブが開き、ログイン済みの AI に質問を送信して回答を取得します。
+    <ul>
+      <li>事前に <strong id="web-info-site"></strong> へのログインが必要です</li>
+      <li>APIキーは不要です</li>
+      <li>回答取得後タブは自動で閉じられます</li>
+    </ul>
+  </div>
+
+  <button class="btn-save" id="save">設定を保存</button>
+  <div id="status"></div>
+
+  <p class="hint">
+    テストページ（<code>attempt.php</code>）を開くと右下に「AIで解答」ボタンが表示されます。
+  </p>
+
+  <script src="popup.js"></script>
+</body>
+</html>
