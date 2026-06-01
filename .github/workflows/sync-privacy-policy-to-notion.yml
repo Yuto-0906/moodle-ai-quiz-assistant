@@ -1,0 +1,36 @@
+name: Sync Privacy Policy to Notion
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - privacy-policy.md
+      - scripts/sync-privacy-policy-to-notion.mjs
+      - .github/workflows/sync-privacy-policy-to-notion.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: "24"
+
+      - name: Sync privacy policy to Notion
+        run: node scripts/sync-privacy-policy-to-notion.mjs
+        env:
+          PRIVACY_POLICY_PATH: privacy-policy.md
+          NOTION_API_KEY: ${{ secrets.NOTION_API_KEY }}
+          NOTION_PAGE_ID: ${{ secrets.NOTION_PAGE_ID }}
+          NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
+          NOTION_TARGET_PAGE_ID: ${{ secrets.NOTION_TARGET_PAGE_ID }}
