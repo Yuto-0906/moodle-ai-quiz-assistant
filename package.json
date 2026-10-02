@@ -1,0 +1,11 @@
+{
+  "name": "moodle-ai-quiz-assistant",
+  "private": true,
+  "scripts": {
+    "test": "node --test --test-isolation=none tests/*.test.cjs",
+    "check": "node --check content.js && node --check chatgpt_content.js && node --check background.js && node --check gemini_content.js && node --check popup.js"
+  },
+  "devDependencies": {
+    "jsdom": "30.1.1"
+  }
+}

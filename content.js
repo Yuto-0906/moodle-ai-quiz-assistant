@@ -18,12 +18,81 @@
     return m ? { usageid: m[1], slot: m[2] } : null;
   }
 
+  function mathToText(node) {
+    const parts = Array.from(node.children ?? []).map(mathToText);
+    switch (node.localName) {
+      case 'mtable': return `matrix(${parts.join('; ')})`;
+      case 'mtr': case 'mlabeledtr': return parts.join(', ');
+      case 'mfrac': return `(${parts[0]})/(${parts[1]})`;
+      case 'msup': return `${parts[0]}^{${parts[1]}}`;
+      case 'msub': return `${parts[0]}_{${parts[1]}}`;
+      case 'msubsup': return `${parts[0]}_{${parts[1]}}^{${parts[2]}}`;
+      case 'msqrt': return `sqrt(${parts.join('')})`;
+      case 'mroot': return `root(${parts[0]}, ${parts[1]})`;
+      case 'semantics': return parts[0] ?? '';
+      case 'annotation': case 'annotation-xml': return '';
+      default: return parts.length ? parts.join('') : node.textContent.trim();
+    }
+  }
+
+  // Rendered MathJax glyphs often have no text nodes. Read its accessible
+  // MathML instead，and keep table cells and rows separate in the prompt.
+  function readContent(root) {
+    if (!root) return '';
+    function read(node) {
+      if (node.nodeType === 3) return node.textContent;
+      if (node.nodeType !== 1) return '';
+      const tag = node.localName;
+      if (tag === 'mjx-container' || node.matches('.MathJax, .MathJax_SVG, .MathJax_CHTML, .MJX_Assistive_MathML')) {
+        const math = node.querySelector('math');
+        return math ? mathToText(math) : (node.getAttribute('aria-label') || node.textContent);
+      }
+      if (tag === 'math') return mathToText(node);
+      if (tag === 'script') return node.type?.startsWith('math/tex') ? `\\(${node.textContent.trim()}\\)` : '';
+      if (['style', 'noscript', 'input', 'button'].includes(tag)) return '';
+      if (tag === 'select' || tag === 'textarea') return '[空欄]';
+      if (tag === 'img') return `[画像${node.alt?.trim() ? `: ${node.alt.trim()}` : ''}]`;
+      if (tag === 'br') return '\n';
+      if (tag === 'table') {
+        return '\n' + Array.from(node.rows).map(row =>
+          Array.from(row.cells).map(cell => readContent(cell).replace(/\n+/g, ' ')).join(' | ')
+        ).join('\n') + '\n';
+      }
+      const text = Array.from(node.childNodes).map(read).join('');
+      return ['p', 'div', 'li', 'ul', 'ol', 'h1', 'h2', 'h3', 'h4', 'blockquote'].includes(tag)
+        ? `\n${text}\n` : text;
+    }
+    return read(root).replace(/\u00a0/g, ' ').replace(/[ \t]+/g, ' ')
+      .replace(/ *\n */g, '\n').replace(/\n{3,}/g, '\n\n').trim();
+  }
+
+  function getChoiceLabels(qDiv, input) {
+    const labelledBy = (input.getAttribute('aria-labelledby') || '').split(/\s+/)
+      .map(id => id && document.getElementById(id)).filter(el => el && qDiv.contains(el));
+    if (labelledBy.length) return labelledBy;
+    const label = Array.from(qDiv.querySelectorAll('label')).find(el => el.htmlFor === input.id)
+      || input.closest('label') || document.getElementById(`${input.id}_label`)
+      || input.parentElement?.querySelector('[data-region="answer-label"]');
+    return label && qDiv.contains(label) ? [label] : [];
+  }
+
+  function getChoiceText(qDiv, input) {
+    const text = getChoiceLabels(qDiv, input).map(readContent).join(' ').trim();
+    return text || input.getAttribute('aria-label') || input.value;
+  }
+
+  function isAnswerChoice(input) {
+    return input.value !== '-1' && !input.closest(
+      '[hidden], [aria-hidden="true"], .qtype_multichoice_clearchoice, .visually-hidden, .sr-only'
+    );
+  }
+
   const KNOWN_TYPES = [
     'shortanswer', 'match', 'multichoice', 'essay', 'truefalse',
     'numerical', 'calculated', 'calculatedsimple', 'calculatedmulti',
     'gapselect', 'ddwtos', 'ddimageortext', 'ddmarker', 'multianswer',
     'ordering', 'randomsamatch', 'regexp', 'pmatch', 'oumultiresponse', 'stack',
-    'multichoiceset'
+    'multichoiceset', 'description'
   ];
 
   function detectType(qDiv) {
@@ -59,7 +128,7 @@
     const seen = new Set();
     selectors.forEach(sel => {
       qDiv.querySelectorAll(sel).forEach(cb => {
-        if (seen.has(cb)) return;
+        if (seen.has(cb) || !isAnswerChoice(cb)) return;
         seen.add(cb);
         boxes.push(cb);
       });
@@ -161,7 +230,9 @@
       const drawWidth = Math.round(img.width * scale);
       const drawHeight = Math.round(img.height * scale);
 
-      ctx.fillText(`image ${img.index}`, x, y);
+      const choice = img.choiceValue != null ? `value ${img.choiceValue}`
+        : img.choiceIndex != null ? `choice ${img.choiceIndex}` : '';
+      ctx.fillText(`image ${img.index}${choice ? ` (${choice})` : ''}`, x, y);
       ctx.strokeStyle = '#d0d7de';
       ctx.strokeRect(x, y + labelHeight, cellWidth, cellHeight - labelHeight);
       ctx.drawImage(img.element, x, y + labelHeight, drawWidth, drawHeight);
@@ -185,7 +256,9 @@
         index: img.index,
         width: img.width,
         height: img.height,
-        alt: img.alt
+        alt: img.alt,
+        choiceValue: img.choiceValue,
+        choiceIndex: img.choiceIndex
       }))
     }];
   }
@@ -206,6 +279,12 @@
         const part = dataUrlToImagePart(dataUrl);
         if (!part) continue;
 
+        const choice = Array.from(qDiv.querySelectorAll('input[type="radio"], input[type="checkbox"]'))
+          .filter(isAnswerChoice).find(input => getChoiceLabels(qDiv, input).some(label => label.contains(img)));
+        const choiceMeta = choice?.type === 'radio' ? { choiceValue: choice.value }
+          : choice ? { choiceIndex: getChoiceIndexFromName(choice.name)
+              ?? collectMultiChoiceCheckboxes(qDiv, getIds(qDiv).usageid, getIds(qDiv).slot).indexOf(choice) } : {};
+
         images.push({
           slot,
           index: images.length + 1,
@@ -215,7 +294,8 @@
           height: img.naturalHeight || Math.round(img.getBoundingClientRect().height),
           mimeType: part.mimeType,
           base64: part.base64,
-          dataUrl
+          dataUrl,
+          ...choiceMeta
         });
       } catch (e) {
         console.warn('[Moodle AI] image skipped:', src, e);
@@ -256,7 +336,7 @@
     const type = detectType(qDiv);
     if (!type) return null;
 
-    const questionText = qDiv.querySelector('.qtext')?.innerText?.trim() ?? '';
+    const questionText = readContent(qDiv.querySelector('.qtext'));
     const info = { slot: parseInt(slot), type, questionText, usageid, slotStr: slot };
 
     if (['numerical', 'calculated', 'calculatedsimple'].includes(type)) {
@@ -278,14 +358,15 @@
         info.isMulti = true;
         info.choices = cbs.map((cb, i) => ({
           index: getChoiceIndexFromName(cb.name) ?? i,
-          text: (qDiv.querySelector(`label[for="${cb.id}"]`)?.innerText ?? cb.name).trim()
+          text: getChoiceText(qDiv, cb)
         }));
       } else {
-        const radios = qDiv.querySelectorAll(`input[type="radio"][name="q${usageid}:${slot}_answer"]`);
+        const radios = Array.from(qDiv.querySelectorAll(`input[type="radio"][name="q${usageid}:${slot}_answer"]`))
+          .filter(isAnswerChoice);
         info.isMulti = false;
         info.choices = Array.from(radios).map(r => ({
           value: r.value,
-          text: (qDiv.querySelector(`label[for="${r.id}"]`)?.innerText ?? r.value).trim()
+          text: getChoiceText(qDiv, r)
         }));
       }
 
@@ -299,7 +380,7 @@
         Array.from(sel.options)
           .filter(o => o.value !== '0' && o.value !== '')
           .forEach(o => optionSet.add(o.text.trim()));
-        info.subQuestions.push({ index: i, text: textEl.innerText.trim() });
+        info.subQuestions.push({ index: i, text: readContent(textEl) });
       });
       info.options = Array.from(optionSet);
 
@@ -343,10 +424,11 @@
             .map(o => ({ value: o.value, text: o.text.trim() }));
         } else if (el.type === 'radio') {
           sub.subType = 'radio';
-          const radios = qDiv.querySelectorAll(`[name="q${usageid}:${slot}_sub${m[1]}_answer"]`);
+          const radios = Array.from(qDiv.querySelectorAll(`[name="q${usageid}:${slot}_sub${m[1]}_answer"]`))
+            .filter(isAnswerChoice);
           sub.options = Array.from(radios).map(r => ({
             value: r.value,
-            text: (qDiv.querySelector(`label[for="${r.id}"]`)?.innerText ?? r.value).trim()
+            text: getChoiceText(qDiv, r)
           }));
         } else {
           sub.subType = 'text';
@@ -361,7 +443,7 @@
       const cbs = collectMultiChoiceCheckboxes(qDiv, usageid, slot);
       info.choices = cbs.map((cb, i) => ({
         index: getChoiceIndexFromName(cb.name) ?? i,
-        text: (qDiv.querySelector(`label[for="${cb.id}"]`)?.innerText ?? cb.name).trim()
+        text: getChoiceText(qDiv, cb)
       }));
 
     } else if (type === 'stack') {
@@ -438,95 +520,44 @@
   }
 
   function buildPrompt(infos) {
-    const template = { questions: infos.map(buildAnswerTemplate) };
+    const questions = infos.filter(q => q.type !== 'description');
+    const template = { questions: questions.map(buildAnswerTemplate) };
+    const promptData = { contexts: [], questions: [] };
+    let contextSlot = null;
+    infos.forEach(q => {
+      const { usageid, slotStr, images, ...data } = q;
+      if (images?.length) {
+        data.images = images.map(img => ({
+          ref: `[slot:${q.slot} image:${img.index}]`,
+          fileName: `moodle-slot-${q.slot}-image-${img.index}.${img.mimeType.split('/')[1]?.split('+')[0] || 'png'}`,
+          mimeType: img.mimeType, width: img.width, height: img.height, alt: img.alt,
+          choiceValue: img.choiceValue, choiceIndex: img.choiceIndex,
+          panels: img.combinedFrom
+        }));
+      }
+      if (q.type === 'description') {
+        contextSlot = q.slot;
+        promptData.contexts.push(data);
+      } else {
+        if (contextSlot != null) data.contextSlots = [contextSlot];
+        promptData.questions.push(data);
+      }
+    });
 
     const lines = [
       '以下のMoodleテストの問題に正確に答えてください。',
       '必ず下記のJSON形式のみで返答してください。余分な説明やコードブロック（```）は不要です。JSONのみを返してください。',
+      'contextsは後続の設問に共通する説明です。各設問のcontextSlotsが参照する説明・表・数式・画像を併せて読んでください。contextsへの回答は不要です。',
+      '単一選択のanswerにはchoicesのvalueを，複数選択のanswersにはchoicesのindexを整数配列で返してください。',
+      '画像のrefとfileNameは添付画像に対応します。panelsがある画像は複数の図を並べたものです。各パネルのindexとchoiceValueまたはchoiceIndexを使って選択肢と対応させてください。',
+      '穴埋め・組合せ・ドラッグ問題のanswersはテンプレートのキーを使い，該当する選択肢のテキストを返してください。',
+      'multianswerの選択式サブ問題にはoptionsのvalueを返してください。並べ替えはorderにitemsのテキストを正しい順序で返してください。',
       '',
       JSON.stringify(template, null, 2),
       '',
-      '【問題一覧】'
+      '【問題データ（JSON）】',
+      JSON.stringify(promptData, null, 2)
     ];
-
-    infos.forEach(q => {
-      lines.push('');
-      lines.push(`[slot:${q.slot}] 種類: ${q.type}`);
-      lines.push(`問題文: ${q.questionText}`);
-      if (q.images?.length) {
-        lines.push('画像:');
-        q.images.forEach(img => {
-          const alt = img.alt ? ` alt="${img.alt}"` : '';
-          lines.push(`  [slot:${q.slot} image:${img.index}] ${img.mimeType} ${img.width}x${img.height}${alt}`);
-          if (img.combinedFrom?.length) {
-            lines.push(`    ※ この画像は元画像${img.combinedFrom.length}枚を並べた合成画像です。各パネルの "image N" ラベルを参照してください。`);
-            img.combinedFrom.forEach(src => {
-              const srcAlt = src.alt ? ` alt="${src.alt}"` : '';
-              lines.push(`    元画像 image ${src.index}: ${src.width}x${src.height}${srcAlt}`);
-            });
-          }
-        });
-      }
-
-      switch (q.type) {
-        case 'numerical': case 'calculated': case 'calculatedsimple':
-          if (q.unitOptions) lines.push(`単位の選択肢: ${q.unitOptions.join(', ')}`);
-          else if (q.hasUnitInput) lines.push('単位: テキストで入力してください');
-          break;
-        case 'truefalse':
-          lines.push('選択肢: 1=True, 0=False');
-          break;
-        case 'multichoice': case 'calculatedmulti': case 'multichoiceset':
-          if (q.isMulti) {
-            lines.push('【複数選択可】正しい選択肢を全て選んでください。');
-            lines.push('answersフィールドには正解の選択肢番号（0始まりの整数）を配列で返してください。例: "answers": [0, 2]');
-            lines.push('選択肢（番号: テキスト）:');
-            (q.choices ?? []).forEach(c => lines.push(`  ${c.index}: ${c.text}`));
-          } else {
-            lines.push('（単一選択）選択肢:');
-            (q.choices ?? []).forEach(c => lines.push(`  value="${c.value}": ${c.text}`));
-          }
-          break;
-        case 'match': case 'randomsamatch':
-          lines.push(`選択肢プール: ${(q.options ?? []).join(', ')}`);
-          lines.push('サブ問題:');
-          (q.subQuestions ?? []).forEach(sq => lines.push(`  ${sq.index}: ${sq.text}`));
-          break;
-        case 'gapselect':
-          lines.push('穴埋め問題（各空欄の選択肢）:');
-          (q.gaps ?? []).forEach(g => lines.push(`  p${g.place}: ${g.options.join(' / ')}`));
-          break;
-        case 'ddwtos': case 'ddimageortext':
-          lines.push(`使用可能な語句: ${Object.values(q.dragItems ?? {}).join(', ')}`);
-          lines.push(`空欄の番号: ${(q.places ?? []).join(', ')}`);
-          break;
-        case 'ddmarker':
-          lines.push(`マーカーの種類: ${JSON.stringify(q.markerLabels ?? {})}`);
-          lines.push('※ 各マーカーを配置すべき座標をx,y形式で指定してください');
-          break;
-        case 'multianswer':
-          lines.push('複合問題のサブ問題:');
-          (q.subInputs ?? []).forEach(s => {
-            if (s.subType === 'text') {
-              lines.push(`  sub${s.index}: テキスト入力`);
-            } else {
-              lines.push(`  sub${s.index} (${s.subType}): ${s.options.map(o => o.text).join(' / ')}`);
-            }
-          });
-          break;
-        case 'ordering':
-          lines.push('並べ替え問題。正しい順序に並べ直してください。アイテム:');
-          (q.items ?? []).forEach((item, i) => lines.push(`  ${i + 1}. ${item}`));
-          break;
-        case 'oumultiresponse':
-          lines.push('（複数選択可）選択肢:');
-          (q.choices ?? []).forEach(c => lines.push(`  インデックス${c.index}: ${c.text}`));
-          break;
-        case 'stack':
-          lines.push(`数式入力（Maxima形式で記述）。入力フィールド: ${(q.answerFields ?? []).join(', ')}`);
-          break;
-      }
-    });
 
     return lines.join('\n');
   }
@@ -905,7 +936,8 @@
         console.error('[Moodle AI] extractInfo failed:', id, e);
       }
     });
-    if (infos.length === 0) throw new Error('対応している問題タイプが見つかりませんでした');
+    const questionCount = infos.filter(q => q.type !== 'description').length;
+    if (questionCount === 0) throw new Error('対応している問題タイプが見つかりませんでした');
 
     // Fetch settings — wrap in try-catch to detect invalidated extension context
     let settings;
@@ -939,13 +971,13 @@
     }
 
     console.log('[Moodle AI] Detected questions:', infos.map(q => `slot${q.slot}(${q.type})`).join(', '));
-    updateStatus(`${infos.length}問を解析中...`);
+    updateStatus(`${questionCount}問を解析中...`);
     const images = await attachImages(infos, qDivs);
     if (images.length > 0) {
       updateStatus(`${images.length}枚の画像を含めてプロンプトを生成中...`);
       console.log('[Moodle AI] Attached images:', images.map(img => `slot${img.slot}#${img.index} ${img.mimeType} ${img.width}x${img.height}`).join(', '));
     } else {
-      updateStatus(`${infos.length}問のプロンプトを生成中...`);
+      updateStatus(`${questionCount}問のプロンプトを生成中...`);
     }
     const prompt = buildPrompt(infos);
     console.log('[Moodle AI] Prompt length:', prompt.length, 'chars');

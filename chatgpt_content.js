@@ -33,33 +33,48 @@ async function waitForElement(selectors, timeout = 20000) {
 }
 
 function getPromptInput() {
-  return document.querySelector('#prompt-textarea') ||
-    document.querySelector('div[contenteditable="true"][data-gramm]') ||
-    document.querySelector('div[contenteditable="true"]');
+  const selectors = [
+    '[data-composer-markdown][contenteditable="true"]',
+    '#prompt-textarea',
+    '[contenteditable="true"][role="textbox"]',
+    'div[contenteditable="true"][data-gramm]'
+  ];
+  for (const selector of selectors) {
+    const input = Array.from(document.querySelectorAll(selector)).find(isVisible);
+    if (input) return input;
+  }
+  return null;
+}
+
+function isVisible(el) {
+  if (!el || !el.isConnected || el.closest('[hidden], [aria-hidden="true"]')) return false;
+  const rect = el.getBoundingClientRect();
+  return rect.width > 0 && rect.height > 0 && getComputedStyle(el).visibility !== 'hidden';
+}
+
+function getComposerRoot() {
+  const input = getPromptInput();
+  return input?.closest('form, [data-composer-body], [data-testid="composer"]') || input?.parentElement;
+}
+
+async function waitForPromptInput(timeout = 25000) {
+  const deadline = Date.now() + timeout;
+  while (Date.now() < deadline) {
+    const input = getPromptInput();
+    if (input) return input;
+    await sleep(300);
+  }
+  throw new Error('ChatGPT: 入力欄が見つかりませんでした。');
 }
 
 function countComposerImages() {
-  const selectors = [
-    '[data-testid*="attachment"]',
-    '[data-testid*="file"]',
-    '[class*="attachment"]',
-    '[class*="FilePreview"]',
-    'img[src^="blob:"]',
-    'img[src^="data:image"]',
-    'img[alt*="Uploaded" i]',
-    'img[alt*="添付" i]'
-  ];
-
-  const nodes = new Set();
-  selectors.forEach(sel => {
-    try {
-      document.querySelectorAll(sel).forEach(el => {
-        const rect = el.getBoundingClientRect();
-        if (rect.width > 8 && rect.height > 8) nodes.add(el);
-      });
-    } catch (_) {}
-  });
-  return nodes.size;
+  const root = getComposerRoot();
+  if (!root) return 0;
+  // Count each thumbnail once. Looking across the page also counts history
+  // images and multiple nested elements belonging to the same attachment.
+  return Array.from(root.querySelectorAll('img')).filter(img =>
+    isVisible(img) && !img.closest('button')
+  ).length;
 }
 
 async function waitForComposerImages(previousCount, expectedCount, timeout = 20000) {
@@ -73,53 +88,59 @@ async function waitForComposerImages(previousCount, expectedCount, timeout = 200
 }
 
 function getSendButton() {
+  const root = getComposerRoot();
+  if (!root) return null;
   const selectors = [
     'button[data-testid="send-button"]',
+    'button[aria-label="送信"]',
+    'button[aria-label="Send"]',
     'button[aria-label="Send prompt"]',
     'button[aria-label="メッセージを送信"]',
+    'button[aria-label="プロンプトを送信"]',
     'button[aria-label="Send message"]'
   ];
 
   for (const sel of selectors) {
     try {
-      const btn = document.querySelector(sel);
-      if (btn) return btn.closest('button') ?? btn;
+      const btn = Array.from(root.querySelectorAll(sel)).find(isVisible);
+      if (btn) return btn;
     } catch (_) {}
   }
-  return null;
+  // The current composer uses a submit button without a data-testid.
+  return Array.from(root.querySelectorAll('button[type="submit"]')).find(btn =>
+    isVisible(btn) && !/stop|停止|cancel|キャンセル|音声|voice/i.test(btn.getAttribute('aria-label') || '')
+  ) || null;
 }
 
 function isSendButtonReady(btn) {
-  if (!btn) return false;
+  if (!isVisible(btn)) return false;
   const ariaDisabled = btn.getAttribute('aria-disabled') === 'true';
-  return !btn.disabled && !ariaDisabled;
+  return !btn.disabled && !ariaDisabled && btn.getAttribute('aria-busy') !== 'true';
 }
 
 async function waitForUploadsToSettle(imageCount) {
   if (!imageCount) return;
 
-  const minWait = Math.min(10000 + imageCount * 2000, 25000);
-  console.log('[Moodle AI] ChatGPT: waiting for image upload settle, ms =', minWait);
-  await sleep(minWait);
-
-  const deadline = Date.now() + 45000;
+  const deadline = Date.now() + 60000;
+  let readySince = null;
   while (Date.now() < deadline) {
     const btn = getSendButton();
-    if (isSendButtonReady(btn)) {
-      console.log('[Moodle AI] ChatGPT: send button ready after image upload');
-      return;
+    const uploading = getComposerRoot()?.querySelector(
+      '[role="progressbar"], [aria-busy="true"], [data-state="uploading"]'
+    );
+    if (countComposerImages() >= imageCount && isSendButtonReady(btn) && !uploading) {
+      readySince ??= Date.now();
+      if (Date.now() - readySince >= 1000) return;
+    } else {
+      readySince = null;
     }
-    console.log('[Moodle AI] ChatGPT: send button not ready yet');
-    await sleep(1000);
+    await sleep(500);
   }
+  throw new Error('ChatGPT: 画像のアップロードが完了しませんでした。添付画像とエラー表示を確認してください。');
 }
 
 async function pasteImageIntoPrompt(image) {
-  const input = getPromptInput() || await waitForElement([
-    '#prompt-textarea',
-    'div[contenteditable="true"][data-gramm]',
-    'div[contenteditable="true"]'
-  ], 25000);
+  const input = getPromptInput() || await waitForPromptInput();
 
   input.focus();
   await sleep(300);
@@ -200,32 +221,40 @@ async function attachImages(images) {
 }
 
 /**
- * Type the prompt into ChatGPT's contenteditable input.
- * ChatGPT uses a ProseMirror-backed <div id="prompt-textarea" contenteditable>.
+ * Insert the prompt through the editor's input path and verify its full text.
+ * Support both the current ProseMirror composer and legacy textarea inputs.
  */
 async function typePrompt(prompt) {
-  const input = await waitForElement([
-    '#prompt-textarea',
-    'div[contenteditable="true"][data-gramm]',
-    'div[contenteditable="true"]'
-  ], 25000);
+  const input = await waitForPromptInput();
 
   input.focus();
   await sleep(300);
 
-  // Clear then insert via execCommand (works with React/ProseMirror)
-  document.execCommand('selectAll', false, null);
-  document.execCommand('insertText', false, prompt);
+  if (input.tagName === 'TEXTAREA') {
+    const setter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value').set;
+    setter.call(input, prompt);
+    input.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: prompt }));
+  } else {
+    // Limit selection to this editor. selectAll can select the entire page
+    // when the composer was replaced during a React render.
+    const range = document.createRange();
+    range.selectNodeContents(input);
+    const selection = window.getSelection();
+    selection.removeAllRanges();
+    selection.addRange(range);
+    if (!document.execCommand('insertText', false, prompt)) {
+      const clipboardData = new DataTransfer();
+      clipboardData.setData('text/plain', prompt);
+      input.dispatchEvent(new ClipboardEvent('paste', { clipboardData, bubbles: true, cancelable: true }));
+    }
+  }
   await sleep(400);
 
-  // Verify insertion; fallback to direct property manipulation
-  if (!input.textContent.trim()) {
-    const nativeSetter = Object.getOwnPropertyDescriptor(
-      window.HTMLElement.prototype, 'textContent'
-    ).set;
-    nativeSetter.call(input, prompt);
-    input.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText' }));
-    await sleep(300);
+  const current = getPromptInput();
+  const actual = current?.tagName === 'TEXTAREA' ? current.value : current?.innerText;
+  const normalize = text => String(text ?? '').replace(/\s+/g, ' ').trim();
+  if (normalize(actual) !== normalize(prompt)) {
+    throw new Error('ChatGPT: 問題文を入力欄に正しく挿入できませんでした。ページを再読み込みして再試行してください。');
   }
 }
 
@@ -246,40 +275,62 @@ async function clickSend(timeout = 8000) {
     throw new Error('ChatGPT: 送信ボタンが有効になりませんでした。画像アップロードがまだ終わっていない可能性があります。');
   }
 
+  const previousMessages = captureAssistantMessages();
   btn.click();
+  return previousMessages;
+}
+
+function getStopButton() {
+  return Array.from(document.querySelectorAll(
+    'button[data-testid="stop-button"], button[aria-label="Stop generating"], ' +
+    'button[aria-label="Stop response"], button[aria-label="生成を停止"], ' +
+    'button[aria-label="応答を停止"], button[aria-label="回答を停止"], button[aria-label="停止"]'
+  )).find(isVisible) || null;
+}
+
+function getAssistantMessages() {
+  const selectors = '[data-markdown-text-style="assistant-message"], ' +
+    '[data-message-author-role="assistant"], [data-message-author="assistant"], ' +
+    '[data-testid="assistant-message"], [data-turn="assistant"]';
+  return Array.from(document.querySelectorAll(
+    selectors
+  )).filter(el => !el.parentElement?.closest(selectors));
+}
+
+function getMessageKey(el) {
+  return el.getAttribute('data-message-id')
+    || el.closest('[data-chatgpt-selection-message-id]')?.getAttribute('data-chatgpt-selection-message-id')
+    || el;
+}
+
+function captureAssistantMessages() {
+  return new Set(getAssistantMessages().map(getMessageKey));
 }
 
 /**
- * Wait until ChatGPT finishes streaming its response.
- * Strategy: wait for the stop-button to appear (generation started),
- * then wait for it to disappear (generation done).
+ * Wait for a new assistant message to stop streaming and remain stable.
+ * The pre-send message snapshot prevents returning an older conversation turn.
  */
-async function waitForResponse() {
-  // 1. Wait for generation to start (stop button appears)
-  await waitForElement([
-    'button[data-testid="stop-button"]',
-    'button[aria-label="Stop generating"]',
-    'button[aria-label="生成を停止"]'
-  ], 30000).catch(() => {
-    // If stop button never appears, generation may have finished instantly
-  });
-
-  // 2. Wait for stop button to disappear (generation done)
-  const deadline = Date.now() + 180_000;
+async function waitForResponse(previousMessages, timeout = 180000) {
+  const deadline = Date.now() + timeout;
+  let lastText = '';
+  let stableSince = Date.now();
   while (Date.now() < deadline) {
-    const stopBtn = document.querySelector(
-      'button[data-testid="stop-button"], button[aria-label="Stop generating"], button[aria-label="生成を停止"]'
+    const messages = getAssistantMessages().filter(el =>
+      !previousMessages.has(getMessageKey(el))
     );
-    if (!stopBtn) break;
+    const latest = messages[messages.length - 1];
+    const text = latest?.innerText?.trim() || '';
+    if (text !== lastText) {
+      lastText = text;
+      stableSince = Date.now();
+    }
+    const streaming = latest?.closest('[data-is-streaming="true"]')
+      || latest?.querySelector('[data-is-streaming="true"]');
+    if (text && !getStopButton() && !streaming && Date.now() - stableSince >= 1800) return text;
     await sleep(600);
   }
-
-  await sleep(800); // Let DOM settle after streaming
-
-  // 3. Extract last assistant message
-  const msgs = document.querySelectorAll('[data-message-author-role="assistant"]');
-  if (!msgs.length) throw new Error('ChatGPT: 回答メッセージが見つかりませんでした');
-  return msgs[msgs.length - 1].innerText.trim();
+  throw new Error('ChatGPT: 新しい回答の完了を確認できませんでした。送信状態・通信エラー・利用上限を確認してください。');
 }
 
 // ── Main ────────────────────────────────────────────────────────────────────
@@ -307,8 +358,8 @@ async function main() {
     await typePrompt(response.prompt);
     await attachImages(response.images ?? []);
     await waitForUploadsToSettle(expectedImages);
-    await clickSend(expectedImages > 0 ? 45000 : 8000);
-    const text = await waitForResponse();
+    const previousMessages = await clickSend(expectedImages > 0 ? 45000 : 8000);
+    const text = await waitForResponse(previousMessages);
     chrome.runtime.sendMessage({ action: 'webAIDone', text });
   } catch (e) {
     chrome.runtime.sendMessage({ action: 'webAIError', error: e.message });
