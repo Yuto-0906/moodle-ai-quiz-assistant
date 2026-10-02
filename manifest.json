@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Moodle AI Quiz Assistant",
-  "version": "1.1.1",
+  "version": "1.1.2",
   "description": "Moodleの小テスト画面でChatGPT/Geminiによる解答支援を行うChrome拡張機能",
   "permissions": ["storage"],
   "host_permissions": [
