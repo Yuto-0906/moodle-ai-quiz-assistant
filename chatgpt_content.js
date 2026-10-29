@@ -57,6 +57,10 @@ function getComposerRoot() {
   return input?.closest('form, [data-composer-body], [data-testid="composer"]') || input?.parentElement;
 }
 
+function getComposerText(input = getPromptInput()) {
+  return (input?.tagName === 'TEXTAREA' ? input.value : input?.innerText) || '';
+}
+
 async function waitForPromptInput(timeout = 25000) {
   const deadline = Date.now() + timeout;
   while (Date.now() < deadline) {
@@ -224,11 +228,20 @@ async function attachImages(images) {
  * Insert the prompt through the editor's input path and verify its full text.
  * Support both the current ProseMirror composer and legacy textarea inputs.
  */
-async function typePrompt(prompt) {
+async function typePrompt(prompt, { requireEmpty = false } = {}) {
   const input = await waitForPromptInput();
 
+  function checkRecoveryInput() {
+    if (requireEmpty && (getPromptInput() !== input || getComposerText(input).trim() || getStopButton())) {
+      const error = new Error('ChatGPT: 入力中または生成中のため，自動の再掲依頼を待機する。');
+      error.code = 'COMPOSER_BUSY';
+      throw error;
+    }
+  }
+  checkRecoveryInput();
   input.focus();
   await sleep(300);
+  checkRecoveryInput();
 
   if (input.tagName === 'TEXTAREA') {
     const setter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value').set;
@@ -314,23 +327,78 @@ function captureAssistantMessages() {
 async function waitForResponse(previousMessages, timeout = 180000) {
   const deadline = Date.now() + timeout;
   let lastText = '';
+  let lastMessageKey = null;
   let stableSince = Date.now();
+  let observedActivity = false;
+  let observedText = false;
+  let emptySince = null;
   while (Date.now() < deadline) {
     const messages = getAssistantMessages().filter(el =>
       !previousMessages.has(getMessageKey(el))
     );
     const latest = messages[messages.length - 1];
     const text = latest?.innerText?.trim() || '';
-    if (text !== lastText) {
+    const key = latest ? getMessageKey(latest) : null;
+    if (text !== lastText || key !== lastMessageKey) {
       lastText = text;
+      lastMessageKey = key;
       stableSince = Date.now();
     }
     const streaming = latest?.closest('[data-is-streaming="true"]')
       || latest?.querySelector('[data-is-streaming="true"]');
-    if (text && !getStopButton() && !streaming && Date.now() - stableSince >= 1800) return text;
+    const generating = !!getStopButton() || !!streaming;
+    observedActivity ||= generating || messages.length > 0;
+    observedText ||= !!text;
+    if (text && !generating && Date.now() - stableSince >= 1800) return text;
+
+    // Only recover an entirely empty turn after observing a new reply or
+    // generation activity. A missing send acknowledgement or a partial reply
+    // must not cause another message to be submitted.
+    if (!text && !observedText && observedActivity && !generating && !getComposerText().trim()) {
+      emptySince ??= Date.now();
+      if (Date.now() - emptySince >= 12000) {
+        const error = new Error('ChatGPT: 生成後も回答本文が空白のままだった。');
+        error.code = 'EMPTY_RESPONSE';
+        throw error;
+      }
+    } else {
+      emptySince = null;
+    }
     await sleep(600);
   }
   throw new Error('ChatGPT: 新しい回答の完了を確認できませんでした。送信状態・通信エラー・利用上限を確認してください。');
+}
+
+async function waitForResponseWithRecovery(previousMessages, timeout = 180000) {
+  const deadline = Date.now() + timeout;
+  let retried = false;
+  while (Date.now() < deadline) {
+    try {
+      return await waitForResponse(previousMessages, deadline - Date.now());
+    } catch (error) {
+      if (error.code !== 'EMPTY_RESPONSE') throw error;
+      if (retried) {
+        throw new Error('ChatGPT: 再掲を1回依頼したが，回答本文が空白のままだった。開いたタブで回答を確認すること。');
+      }
+      if (getStopButton() || getComposerText().trim()) continue;
+      if (deadline - Date.now() < 1000) throw error;
+
+      try {
+        await typePrompt(
+          '前の回答が空白で見えない。同じ問題への解答を，1つのjsonコードブロックとしてこのチャットの本文に再掲すること。' +
+          '元のJSON形式と設問のslotを維持し，説明文，Canvas，添付ファイルへの出力は不要。',
+          { requireEmpty: true }
+        );
+      } catch (inputError) {
+        if (inputError.code === 'COMPOSER_BUSY') continue;
+        throw inputError;
+      }
+      console.warn('[Moodle AI] ChatGPT: empty response; requesting a visible reply once');
+      previousMessages = await clickSend(Math.min(8000, Math.max(0, deadline - Date.now())));
+      retried = true;
+    }
+  }
+  throw new Error('ChatGPT: 時間内に新しい回答の完了を確認できませんでした。開いたタブで回答を確認すること。');
 }
 
 // ── Main ────────────────────────────────────────────────────────────────────
@@ -359,7 +427,7 @@ async function main() {
     await attachImages(response.images ?? []);
     await waitForUploadsToSettle(expectedImages);
     const previousMessages = await clickSend(expectedImages > 0 ? 45000 : 8000);
-    const text = await waitForResponse(previousMessages);
+    const text = await waitForResponseWithRecovery(previousMessages);
     chrome.runtime.sendMessage({ action: 'webAIDone', text });
   } catch (e) {
     chrome.runtime.sendMessage({ action: 'webAIError', error: e.message });

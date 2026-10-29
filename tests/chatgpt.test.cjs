@@ -5,7 +5,7 @@ const { loadScript, fakeClock } = require('./helpers.cjs');
 function chat(html = '', editor = '<div contenteditable="true" data-composer-markdown role="textbox"><p></p></div>') {
   return loadScript('chatgpt_content.js', `<div data-composer-body>${editor}${html}</div>`, [
     'getPromptInput', 'getSendButton', 'isSendButtonReady', 'countComposerImages', 'typePrompt',
-    'clickSend', 'captureAssistantMessages', 'waitForResponse', 'waitForUploadsToSettle'
+    'clickSend', 'captureAssistantMessages', 'waitForResponse', 'waitForResponseWithRecovery', 'waitForUploadsToSettle'
   ]);
 }
 
@@ -145,4 +145,158 @@ test('image upload waits for progress to finish even when the send button is ena
   const elapsed = fakeClock(window, now => { if (now >= 2000) document.getElementById('progress')?.remove(); });
   await api.waitForUploadsToSettle(1);
   assert.ok(elapsed() >= 3000);
+});
+
+function emptyReplyChat() {
+  const state = chat('<button type="submit" aria-label="送信" id="send"></button>');
+  state.previous = state.api.captureAssistantMessages();
+  state.document.body.insertAdjacentHTML('beforeend',
+    '<div data-message-author-role="assistant" data-message-id="empty"></div>');
+  state.document.execCommand = (_command, _ui, text) => {
+    state.api.getPromptInput().textContent = text;
+    return true;
+  };
+  return state;
+}
+
+test('an entirely empty new reply is distinguished from a normal timeout after an idle grace period', async () => {
+  const { window, api, previous } = emptyReplyChat();
+  const elapsed = fakeClock(window);
+  await assert.rejects(api.waitForResponse(previous, 20000), { code: 'EMPTY_RESPONSE' });
+  assert.ok(elapsed() >= 12000);
+});
+
+test('an empty reply still being generated never triggers a recovery message', async () => {
+  const { window, document, api, previous } = emptyReplyChat();
+  document.body.insertAdjacentHTML('beforeend', '<button aria-label="停止"></button>');
+  let clicks = 0;
+  document.getElementById('send').addEventListener('click', () => clicks++);
+  fakeClock(window);
+  await assert.rejects(api.waitForResponseWithRecovery(previous, 20000), /完了を確認できません/);
+  assert.equal(clicks, 0);
+});
+
+test('an empty streaming container blocks recovery even without a stop button', async () => {
+  const { window, document, api, previous } = emptyReplyChat();
+  document.querySelector('[data-message-id="empty"]').setAttribute('data-is-streaming', 'true');
+  let clicks = 0;
+  document.getElementById('send').addEventListener('click', () => clicks++);
+  fakeClock(window);
+  await assert.rejects(api.waitForResponseWithRecovery(previous, 20000), /完了を確認できません/);
+  assert.equal(clicks, 0);
+});
+
+test('observed generation can recover a blank turn that never renders a message container', async () => {
+  const { window, document, api } = chat('<button aria-label="送信" id="send"></button>');
+  const previous = api.captureAssistantMessages();
+  document.body.insertAdjacentHTML('beforeend', '<button aria-label="停止" id="stop"></button>');
+  document.execCommand = (_command, _ui, text) => {
+    api.getPromptInput().textContent = text;
+    return true;
+  };
+  let clicks = 0;
+  document.getElementById('send').addEventListener('click', () => {
+    clicks++;
+    api.getPromptInput().textContent = '';
+    document.body.insertAdjacentHTML('beforeend', '<div data-message-author-role="assistant" data-message-id="recovered">{"questions":[]}</div>');
+  });
+  fakeClock(window, now => { if (now >= 1800) document.getElementById('stop')?.remove(); });
+  assert.equal(await api.waitForResponseWithRecovery(previous, 40000), '{"questions":[]}');
+  assert.equal(clicks, 1);
+});
+
+test('the empty grace period starts after generation stops，even after a long thinking phase', async () => {
+  const { window, document, api, previous } = emptyReplyChat();
+  document.body.insertAdjacentHTML('beforeend', '<button aria-label="停止" id="stop"></button>');
+  const elapsed = fakeClock(window, now => { if (now >= 18000) document.getElementById('stop')?.remove(); });
+  await assert.rejects(api.waitForResponse(previous, 35000), { code: 'EMPTY_RESPONSE' });
+  assert.ok(elapsed() >= 30000);
+});
+
+test('delayed rendering of the original answer completes without requesting another answer', async () => {
+  const { window, document, api, previous } = emptyReplyChat();
+  let clicks = 0;
+  document.getElementById('send').addEventListener('click', () => clicks++);
+  fakeClock(window, now => {
+    if (now >= 6000) document.querySelector('[data-message-id="empty"]').textContent = '{"questions":[{"slot":2,"answer":"1"}]}';
+  });
+  assert.equal(await api.waitForResponseWithRecovery(previous, 30000), '{"questions":[{"slot":2,"answer":"1"}]}');
+  assert.equal(clicks, 0);
+});
+
+test('one automatic follow-up recovers an empty answer and reads only its new response', async () => {
+  const { window, document, api, previous } = emptyReplyChat();
+  let clicks = 0;
+  document.getElementById('send').addEventListener('click', () => {
+    clicks++;
+    assert.ok(api.getPromptInput().textContent.trim());
+    api.getPromptInput().textContent = '';
+    document.body.insertAdjacentHTML('beforeend', '<div data-message-author-role="assistant" data-message-id="recovered"><pre><code>```json\n{"questions":[{"slot":2,"answer":"1"}]}\n```</code></pre></div>');
+  });
+  fakeClock(window);
+  const response = await api.waitForResponseWithRecovery(previous, 40000);
+  assert.ok(response.includes('"slot":2'));
+  assert.equal(clicks, 1);
+});
+
+test('a second empty response reports failure without a follow-up loop', async () => {
+  const { window, document, api, previous } = emptyReplyChat();
+  let clicks = 0;
+  document.getElementById('send').addEventListener('click', () => {
+    clicks++;
+    api.getPromptInput().textContent = '';
+    document.body.insertAdjacentHTML('beforeend', '<div data-message-author-role="assistant" data-message-id="still-empty"></div>');
+  });
+  fakeClock(window);
+  await assert.rejects(api.waitForResponseWithRecovery(previous, 40000), /再掲を1回依頼したが/);
+  assert.equal(clicks, 1);
+});
+
+test('a manual follow-up remains supported and its draft is never replaced', async () => {
+  const { window, document, api, previous } = emptyReplyChat();
+  let clicks = 0;
+  document.getElementById('send').addEventListener('click', () => clicks++);
+  let manualSent = false;
+  fakeClock(window, now => {
+    if (now >= 600 && !manualSent) api.getPromptInput().textContent = '見えないです。';
+    if (now >= 15000 && !manualSent) {
+      assert.equal(api.getPromptInput().textContent, '見えないです。');
+      api.getPromptInput().textContent = '';
+      document.body.insertAdjacentHTML('beforeend', '<div data-message-author-role="assistant" data-message-id="manual">{"questions":[{"slot":2,"answer":"1"}]}</div>');
+      manualSent = true;
+    }
+  });
+  assert.equal(await api.waitForResponseWithRecovery(previous, 30000), '{"questions":[{"slot":2,"answer":"1"}]}');
+  assert.equal(clicks, 0);
+});
+
+test('recovery insertion preserves a draft started during the focus delay', async () => {
+  const { window, document, api } = chat();
+  document.execCommand = () => { throw new Error('must not replace the draft'); };
+  fakeClock(window, () => { api.getPromptInput().textContent = '手動入力中'; });
+  await assert.rejects(api.typePrompt('自動再掲', { requireEmpty: true }), { code: 'COMPOSER_BUSY' });
+  assert.equal(api.getPromptInput().textContent, '手動入力中');
+});
+
+test('no observed generation or new message means no speculative follow-up', async () => {
+  const { window, document, api } = chat('<button aria-label="送信" id="send"></button>');
+  let clicks = 0;
+  document.getElementById('send').addEventListener('click', () => clicks++);
+  fakeClock(window);
+  await assert.rejects(api.waitForResponseWithRecovery(api.captureAssistantMessages(), 5000), /完了を確認できません/);
+  assert.equal(clicks, 0);
+});
+
+test('recovery shares the original deadline rather than starting another full timeout', async () => {
+  const { window, document, api, previous } = emptyReplyChat();
+  let clicks = 0;
+  document.getElementById('send').addEventListener('click', () => {
+    clicks++;
+    api.getPromptInput().textContent = '';
+    document.body.insertAdjacentHTML('beforeend', '<button aria-label="停止"></button>');
+  });
+  const elapsed = fakeClock(window);
+  await assert.rejects(api.waitForResponseWithRecovery(previous, 20000), /完了を確認できません/);
+  assert.equal(clicks, 1);
+  assert.ok(elapsed() < 21000);
 });
