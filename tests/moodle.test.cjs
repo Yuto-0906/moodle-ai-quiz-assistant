@@ -4,7 +4,7 @@ const { loadScript, plain } = require('./helpers.cjs');
 
 function moodle(html) {
   return loadScript('content.js', `<form id="responseform">${html}</form>`, [
-    'extractInfo', 'buildPrompt', 'readContent', 'collectQuestionImages', 'applyAnswer'
+    'extractInfo', 'buildPrompt', 'readContent', 'collectQuestionImages', 'applyAnswer', 'parseAIResponse'
   ]);
 }
 
@@ -108,4 +108,11 @@ test('new choice markup still accepts the returned value', () => {
   api.applyAnswer(document.querySelector('.que'), { answer: '1' });
   assert.equal(document.getElementById('q123:2_answer1').checked, true);
   assert.equal(document.getElementById('q123:2_answer0').checked, false);
+});
+
+test('a visible JSON code-block reply can be parsed and applied to the quiz', () => {
+  const { document, api } = moodle(question(2, choice(2, 0, '156') + choice(2, 1, '158')));
+  const response = api.parseAIResponse('```json\n{"questions":[{"slot":2,"answer":"1"}]}\n```');
+  api.applyAnswer(document.querySelector('.que'), response.questions[0]);
+  assert.equal(document.getElementById('q123:2_answer1').checked, true);
 });

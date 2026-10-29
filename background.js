@@ -36,6 +36,11 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg.action === 'webAIDone') {
     const req = pending.get(sender.tab.id);
     if (req) {
+      if (typeof msg.text !== 'string' || !msg.text.trim()) {
+        req.sendResponse({ success: false, error: 'AIの回答本文が空白だった。開いたAIタブで回答を確認すること。' });
+        pending.delete(sender.tab.id);
+        return;
+      }
       req.sendResponse({ success: true, text: msg.text });
       pending.delete(sender.tab.id);
       // Close AI tab after a brief delay so the user can see it finished
@@ -49,7 +54,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     if (req) {
       req.sendResponse({ success: false, error: msg.error });
       pending.delete(sender.tab.id);
-      chrome.tabs.remove(sender.tab.id).catch(() => {});
+      // Leave failed conversations open for inspection or a manual follow-up.
     }
   }
 });
